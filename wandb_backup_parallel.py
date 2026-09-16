@@ -6,13 +6,14 @@
 # - Every run listed in ckpt_target_run_ids.txt (not the full project)
 # - Metadata / config / summary / history
 # - W&B run files
+# - Checkpoints ("model"-type logged artifacts, .ckpt files)
 # - Restart-safe local backup
 # - Skips verified files already downloaded
 # - Retries incomplete/failed files
 #
 # NOTE:
-# This version does NOT yet download W&B Artifacts.
-# Artifact backup should be added as the next layer for a
+# Only "model"-type logged artifacts (checkpoints) are backed up.
+# Other W&B artifact types should be added as the next layer for a
 # genuinely complete W&B archive.
 # ============================================================
 
@@ -419,6 +420,24 @@ def expected_run_contents(run):
         expected[f"files/{wandb_file.name}"] = (
             int(size) if size not in (None, 0, "0") else None
         )
+
+    try:
+        model_artifacts = [a for a in run.logged_artifacts() if a.type == "model"]
+    except Exception:
+        model_artifacts = []
+
+    for artifact in model_artifacts:
+        artifact_dirname = artifact.name.replace(":", "_v")
+        try:
+            entries = artifact.manifest.entries
+        except Exception:
+            entries = {}
+
+        for rel_path, entry in entries.items():
+            size = getattr(entry, "size", None)
+            expected[f"checkpoints/{artifact_dirname}/{rel_path}"] = (
+                int(size) if size not in (None, 0, "0") else None
+            )
 
     return expected
 
@@ -1137,6 +1156,113 @@ def download_wandb_file(
 
 
 # ============================================================
+# 12b. DOWNLOAD RUN CHECKPOINTS
+#
+# "model"-type logged artifacts (.ckpt files) for this run, saved
+# under run_folder/checkpoints/<artifact>/... - inside the same
+# local tree the run's single SFTP upload already covers (see
+# UPLOAD TO SFTP below), so no separate upload step is needed here.
+# Every run processed by this script is a target-list run (see GET
+# TARGET-LIST RUNS above), so unlike wandb_ckpt_backup.py there's no
+# separate "just check for checkpoints" path for non-target runs.
+# ============================================================
+
+def download_run_checkpoints(run, run_folder, run_record):
+    checkpoints_folder = run_folder / "checkpoints"
+
+    try:
+        model_artifacts = [
+            a for a in run.logged_artifacts() if a.type == "model"
+        ]
+    except Exception as e:
+        log_error(f"Run {run.id}: could not list checkpoint artifacts: {e}")
+        run_record["checkpoints"] = {"status": "failed", "error": str(e)}
+        return
+
+    if not model_artifacts:
+        run_record["checkpoints"] = {"status": "complete", "artifacts": {}}
+        print("- No checkpoint (model) artifacts found")
+        return
+
+    existing_artifacts = run_record.get("checkpoints", {}).get("artifacts", {})
+    artifacts_record = {}
+    any_failed = False
+
+    for artifact in model_artifacts:
+        artifact_dirname = artifact.name.replace(":", "_v")
+        dest_dir = checkpoints_folder / artifact_dirname
+
+        if dest_dir.exists() and any(
+            p.is_file() for p in dest_dir.rglob("*")
+        ):
+            print(f"  ↪ SKIP: {artifact.name} (already downloaded)")
+            artifacts_record[artifact.name] = existing_artifacts.get(
+                artifact.name,
+                {"status": "downloaded", "aliases": artifact.aliases}
+            )
+            continue
+
+        downloaded = False
+        last_error = None
+
+        for attempt in range(1, MAX_FILE_RETRIES + 1):
+            print(
+                f"  ↓ Downloading checkpoint: {artifact.name}"
+                f" [attempt {attempt}/{MAX_FILE_RETRIES}]"
+            )
+
+            try:
+                artifact.download(root=str(dest_dir))
+                downloaded = True
+                break
+            except Exception as e:
+                last_error = e
+                print(f"  ✗ Attempt {attempt} failed: {e}")
+
+                if attempt < MAX_FILE_RETRIES:
+                    time.sleep(min(5 * attempt, 30))
+
+        if not downloaded:
+            log_error(
+                f"Run {run.id}: checkpoint artifact {artifact.name} "
+                f"download failed: {last_error}"
+            )
+            artifacts_record[artifact.name] = {
+                "status": "failed",
+                "error": str(last_error)
+            }
+            any_failed = True
+            continue
+
+        files_info = {}
+        for f in sorted(dest_dir.rglob("*")):
+            if f.is_file():
+                files_info[str(f.relative_to(dest_dir))] = {
+                    "size": f.stat().st_size,
+                    "sha256": sha256_file(f),
+                }
+
+        artifacts_record[artifact.name] = {
+            "status": "downloaded",
+            "aliases": artifact.aliases,
+            "files": files_info,
+        }
+
+        print(f"  ✓ COMPLETE: {artifact.name}")
+
+    run_record["checkpoints"] = {
+        "status": "incomplete" if any_failed else "complete",
+        "artifacts": artifacts_record,
+    }
+
+    print(
+        f"Checkpoint artifacts: "
+        f"{sum(1 for a in artifacts_record.values() if a.get('status') != 'failed')}"
+        f"/{len(model_artifacts)} downloaded"
+    )
+
+
+# ============================================================
 # 13. BACKUP ONE RUN
 # ============================================================
 
@@ -1392,7 +1518,7 @@ def backup_run_download(run, run_folder, files_folder, run_record, is_target=Fal
     # METADATA
     # ========================================================
 
-    print("\n[1/5] Metadata")
+    print("\n[1/6] Metadata")
 
     # Rebuilt every time (not just on first download) because it
     # carries the latest backup timestamp.
@@ -1417,7 +1543,7 @@ def backup_run_download(run, run_folder, files_folder, run_record, is_target=Fal
     # CONFIG
     # ========================================================
 
-    print("\n[2/5] Configuration")
+    print("\n[2/6] Configuration")
 
     _save_run_component(
         run, run_record, "config", run_folder / "config.json",
@@ -1428,7 +1554,7 @@ def backup_run_download(run, run_folder, files_folder, run_record, is_target=Fal
     # SUMMARY
     # ========================================================
 
-    print("\n[3/5] Summary metrics")
+    print("\n[3/6] Summary metrics")
 
     _save_run_component(
         run, run_record, "summary", run_folder / "summary.json",
@@ -1439,7 +1565,7 @@ def backup_run_download(run, run_folder, files_folder, run_record, is_target=Fal
     # HISTORY
     # ========================================================
 
-    print("\n[4/5] Run history")
+    print("\n[4/6] Run history")
 
     history_path = (
         run_folder / "history.csv"
@@ -1530,7 +1656,7 @@ def backup_run_download(run, run_folder, files_folder, run_record, is_target=Fal
     # W&B RUN FILES
     # ========================================================
 
-    print("\n[5/5] W&B run files")
+    print("\n[5/6] W&B run files")
 
     successful_files = 0
     skipped_files = 0
@@ -1627,6 +1753,14 @@ def backup_run_download(run, run_folder, files_folder, run_record, is_target=Fal
         run_record["files_error"] = str(e)
 
     # ========================================================
+    # CHECKPOINTS
+    # ========================================================
+
+    print("\n[6/6] Checkpoints")
+
+    download_run_checkpoints(run, run_folder, run_record)
+
+    # ========================================================
     # DETERMINE RUN STATUS
     # ========================================================
 
@@ -1636,7 +1770,8 @@ def backup_run_download(run, run_folder, files_folder, run_record, is_target=Fal
         "metadata",
         "config",
         "summary",
-        "history"
+        "history",
+        "checkpoints"
     ]:
 
         component_record = run_record.get(
@@ -1701,7 +1836,7 @@ def backup_run_download(run, run_folder, files_folder, run_record, is_target=Fal
 
 print("\n")
 print("=" * 70)
-print("STARTING FULL W&B BACKUP")
+print("STARTING TARGET-LIST W&B BACKUP")
 print("=" * 70)
 
 print(
@@ -1729,8 +1864,8 @@ print(
 )
 
 print(
-    "\nNOTE: W&B Artifact contents are not yet "
-    "included in this version."
+    "\nNOTE: only 'model'-type logged artifacts (checkpoints) are "
+    "backed up. Other W&B artifact types are not yet included."
 )
 
 overall_start = time.time()
@@ -1836,7 +1971,7 @@ total_elapsed = (
 
 print("\n")
 print("=" * 70)
-print("FULL BACKUP COMPLETE")
+print("TARGET-LIST BACKUP COMPLETE")
 print("=" * 70)
 
 print(
@@ -2059,6 +2194,7 @@ print(
 )
 
 print(
-    "Artifact backup still needs to be added "
-    "for a complete W&B archive."
+    "Only 'model'-type artifacts (checkpoints) are backed up - "
+    "other W&B artifact types still need to be added for a "
+    "complete W&B archive."
 )

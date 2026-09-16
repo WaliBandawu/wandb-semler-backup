@@ -60,10 +60,10 @@ service account/app-specific credential exempt from interactive 2FA.
 
 | Script | Purpose |
 |---|---|
-| `wandb_backup_parallel.py` | **Main entry point.** Backs up only the [target-list runs](#ckpt_target_run_idstxt) (not the full project), concurrent workers scaled to the machine it runs on. See [Design](#design) below. |
+| `wandb_backup_parallel.py` | **Main entry point.** Backs up only the [target-list runs](#ckpt_target_run_idstxt) (not the full project) — metadata, config, summary, history, run files, and checkpoints — concurrent workers scaled to the machine it runs on. See [Design](#design) below. |
 | `wandb_backup_local.py` | Same backup logic, sequential (single-threaded). Useful for debugging without concurrency noise. Still does a full-project backup - not yet updated to the target-list-only scope above. |
 | `wandb_backup_colab.py` | Same again, tuned for running in a Google Colab notebook cell. Still does a full-project backup - not yet updated to the target-list-only scope above. |
-| `wandb_ckpt_backup.py` | Checkpoint-only pass: downloads/uploads `model`-type logged artifacts (`.ckpt` files) for runs listed in `ckpt_target_run_ids.txt`. Every other run is only checked for *whether* it has checkpoints (recorded in its own manifest), never downloaded. |
+| `wandb_ckpt_backup.py` | Separate, broader checkpoint pass: like `wandb_backup_parallel.py`, downloads/uploads `model`-type logged artifacts for target-list runs, but also walks every *other* run in the full project and checks (never downloads) whether it has checkpoints, recording that fact in its own manifest. Redundant with `wandb_backup_parallel.py` for target-list runs specifically; still useful for that full-project checkpoint-presence sweep. |
 | `sftp_backup_lib.py` | Shared SFTP helpers (connection pooling, retry, atomic upload, remote directory resolution) used by the backup scripts above. |
 | `migrate_drive_to_sftp.py` | One-time migration: copies the old Google-Drive-backed tree to SFTP without re-touching W&B. |
 | `drive_sync.py` / `exchange_drive_token.py` | Legacy Google Drive sync + OAuth token exchange, superseded by the SFTP destination. Kept for reference / in case Drive is ever needed again. |
@@ -152,10 +152,13 @@ previews (name-substring match, case-insensitive), and `output.log`
 
 ## Known limitations
 
-- **W&B Artifacts are not yet backed up** by the main pipeline — only run
-  files, config, summary, and history. `wandb_ckpt_backup.py` covers
-  *checkpoint* artifacts specifically as a separate pass; other artifact
-  types are still a gap.
+- **Only `model`-type W&B Artifacts (checkpoints) are backed up.** The main
+  pipeline downloads these itself now (`checkpoints/<artifact>/...` inside
+  each run's folder, uploaded as part of that run's normal SFTP upload —
+  see [Design](#design)). Other artifact types are still a gap.
+  `wandb_ckpt_backup.py` still exists separately for its broader
+  full-project pass (checking *every* run in the project, not just the
+  target list, for whether it has checkpoint artifacts).
 - The SFTP account requires **TOTP two-factor authentication** in addition
   to a password. This is now handled automatically (see [SFTP two-factor
   authentication](#sftp-two-factor-authentication) above) as long as

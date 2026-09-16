@@ -15,8 +15,17 @@ venv/
 .netrc
 .env
 
-# Backup run artifacts, manifests, logs - generated, not source
+# Backup run artifacts, manifests, logs, caches, staging - generated,
+# not source. wandb_backups/ is resolve_backup_base()'s default local
+# staging directory (sftp_backup_lib.py) when BACKUP_BASE_DIR isn't
+# set - it can hold real downloaded run data (multi-hundred-MB caches,
+# checkpoints, etc.), so it must never be committed.
+wandb_backups/
+_bulk_zip_staging/
+_ckpt_staging/
+_drive_to_sftp_staging/
 backup_manifest.json
 ckpt_manifest.json
 bulk_batch_registry.json
+run_list_cache.json
 *.log
