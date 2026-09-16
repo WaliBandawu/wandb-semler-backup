@@ -22,8 +22,9 @@ import time
 from pathlib import Path
 
 import paramiko
+import pyotp
 
-SFTP_CREDENTIALS_PATH = "/home/ubuntu/.semler_sftp_credentials.json"
+SFTP_CREDENTIALS_PATH = str(Path.home() / ".semler_sftp_credentials.json")
 
 
 def _load_dotenv(path=".env"):
@@ -90,11 +91,17 @@ def _load_credentials():
             "port": int(os.environ.get("SEMLER_SFTP_PORT", "22")),
             "username": username,
             "password": password,
+            # The permanent base32 seed behind the account's TOTP 2FA
+            # (not a rotating 6-digit code) - lets every connection
+            # generate its own valid code with no human involved.
+            "totp_secret": os.environ.get("SEMLER_SFTP_TOTP_SECRET"),
         }
 
     try:
         with open(SFTP_CREDENTIALS_PATH) as f:
-            return json.load(f)
+            creds = json.load(f)
+            creds.setdefault("totp_secret", None)
+            return creds
     except FileNotFoundError:
         raise FileNotFoundError(
             "No SFTP credentials found. Set SEMLER_SFTP_HOST/"
@@ -107,7 +114,51 @@ def _connect():
     creds = _load_credentials()
     transport = paramiko.Transport((creds["host"], creds.get("port", 22)))
     transport.banner_timeout = 30
-    transport.connect(username=creds["username"], password=creds["password"])
+    transport.start_client()
+
+    # Plain password auth only gets partial success on this server -
+    # it then demands a TOTP code via keyboard-interactive before a
+    # channel (e.g. SFTP) can be opened. Drive that second factor
+    # ourselves instead of leaving connect() to silently half-auth.
+    try:
+        remaining = transport.auth_password(
+            creds["username"], creds["password"]
+        )
+    except paramiko.AuthenticationException as e:
+        transport.close()
+        raise paramiko.AuthenticationException(
+            f"SFTP password rejected for {creds['username']}@{creds['host']}: {e}"
+        )
+
+    if not transport.is_authenticated() and "keyboard-interactive" in remaining:
+        totp_secret = creds.get("totp_secret")
+
+        if not totp_secret:
+            transport.close()
+            raise RuntimeError(
+                f"SFTP account {creds['username']}@{creds['host']} requires "
+                "a TOTP code (Two Factor Authentication) after the password, "
+                "but no SEMLER_SFTP_TOTP_SECRET is configured. Set it in "
+                ".env to the account's permanent TOTP seed (the base32 "
+                "string shown when 2FA was enrolled - not a rotating "
+                "6-digit code) so every connection can generate its own "
+                "valid code automatically."
+            )
+
+        totp = pyotp.TOTP(totp_secret)
+
+        def _totp_handler(title, instructions, prompt_list):
+            return [totp.now() for _ in prompt_list]
+
+        transport.auth_interactive(creds["username"], _totp_handler)
+
+    if not transport.is_authenticated():
+        transport.close()
+        raise paramiko.AuthenticationException(
+            f"SFTP authentication did not complete for "
+            f"{creds['username']}@{creds['host']}"
+        )
+
     sftp = paramiko.SFTPClient.from_transport(transport)
     sftp.get_channel().settimeout(120)
     return transport, sftp

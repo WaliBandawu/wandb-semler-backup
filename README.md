@@ -1,17 +1,18 @@
 # W&B → SFTP Backup Pipeline
 
-Backs up every run in the `theta-tech-ai/semler-qfhd` Weights & Biases project
-(metadata, config, summary, history, and run files) to Semler Scientific's
-SFTP server, with a fully restart-safe, resumable design. Originally
-targeted Google Drive as the destination; that's now legacy (see
-[Legacy: Google Drive migration](#legacy-google-drive-migration) below).
+Backs up the curated [target-list runs](#ckpt_target_run_idstxt) from the
+`theta-tech-ai/semler-qfhd` Weights & Biases project (metadata, config,
+summary, history, and run files) to Semler Scientific's SFTP server, with a
+fully restart-safe, resumable design. Originally targeted Google Drive as
+the destination; that's now legacy (see [Legacy: Google Drive
+migration](#legacy-google-drive-migration) below).
 
 ## Quick start
 
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-pip install wandb paramiko
+pip install wandb paramiko pyotp
 
 cp .env.example .env
 # then fill in .env with real values:
@@ -20,6 +21,7 @@ cp .env.example .env
 #   SEMLER_SFTP_PORT=22
 #   SEMLER_SFTP_USERNAME=...
 #   SEMLER_SFTP_PASSWORD=...
+#   SEMLER_SFTP_TOTP_SECRET=...  (the account's permanent TOTP seed - see below)
 # .env is gitignored - it never gets committed.
 
 python3 wandb_backup_parallel.py
@@ -29,17 +31,38 @@ Safe to stop (Ctrl+C) and rerun at any time — it picks up exactly where it
 left off.
 
 If `SEMLER_SFTP_*` isn't set, `sftp_backup_lib.py` falls back to reading a
-JSON credentials file (`{"host", "port", "username", "password"}`) from
-`SFTP_CREDENTIALS_PATH` — the existing method on the server this already
+JSON credentials file (`{"host", "port", "username", "password", "totp_secret"}`)
+from `SFTP_CREDENTIALS_PATH` — the existing method on the server this already
 runs on. `.env` is the easier path for a fresh checkout.
+
+### SFTP two-factor authentication
+
+The `SEMLER_SFTP_*` account requires TOTP 2FA in addition to a password —
+after password auth, the server holds the connection open in a
+`keyboard-interactive` challenge (`"Two Factor Authentication" / "Enter your
+TOTP two factor value."`) before it'll open any channel, SFTP included.
+
+`SEMLER_SFTP_TOTP_SECRET` must be the account's **permanent TOTP seed** — the
+base32 string shown once next to the QR code when 2FA was enrolled (most
+authenticator apps can also export/reveal it for an existing entry) — not a
+rotating 6-digit code, which expires in ~30 seconds and can't be reused.
+With the seed set, `sftp_backup_lib.py` generates a fresh valid code for
+every connection automatically (via `pyotp`), including the many
+per-worker-thread reconnects a full backup makes — no human types a code,
+ever. Without it, any connection attempt fails immediately with an error
+explaining what's missing, rather than hanging.
+
+If nobody has the seed saved, it can only be recovered by re-enrolling 2FA
+on the account (invalidating the old one), or by asking Semler for a
+service account/app-specific credential exempt from interactive 2FA.
 
 ## Scripts
 
 | Script | Purpose |
 |---|---|
-| `wandb_backup_parallel.py` | **Main entry point.** Full project backup, concurrent workers scaled to the machine it runs on. See [Design](#design) below. |
-| `wandb_backup_local.py` | Same backup logic, sequential (single-threaded). Useful for debugging without concurrency noise. |
-| `wandb_backup_colab.py` | Same again, tuned for running in a Google Colab notebook cell. |
+| `wandb_backup_parallel.py` | **Main entry point.** Backs up only the [target-list runs](#ckpt_target_run_idstxt) (not the full project), concurrent workers scaled to the machine it runs on. See [Design](#design) below. |
+| `wandb_backup_local.py` | Same backup logic, sequential (single-threaded). Useful for debugging without concurrency noise. Still does a full-project backup - not yet updated to the target-list-only scope above. |
+| `wandb_backup_colab.py` | Same again, tuned for running in a Google Colab notebook cell. Still does a full-project backup - not yet updated to the target-list-only scope above. |
 | `wandb_ckpt_backup.py` | Checkpoint-only pass: downloads/uploads `model`-type logged artifacts (`.ckpt` files) for runs listed in `ckpt_target_run_ids.txt`. Every other run is only checked for *whether* it has checkpoints (recorded in its own manifest), never downloaded. |
 | `sftp_backup_lib.py` | Shared SFTP helpers (connection pooling, retry, atomic upload, remote directory resolution) used by the backup scripts above. |
 | `migrate_drive_to_sftp.py` | One-time migration: copies the old Google-Drive-backed tree to SFTP without re-touching W&B. |
@@ -96,6 +119,12 @@ transfers. Priority-list runs are exempt from this — they stay as
 individually browsable folders so the strict verification above keeps
 working.
 
+Since `wandb_backup_parallel.py` now only ever processes target-list runs
+(see [Scripts](#scripts) above), every run it sees counts as priority, so
+this path is currently unreachable in practice - dead code kept for when
+`wandb_backup_local.py` / `wandb_backup_colab.py` (which still do full
+non-priority backups) need it.
+
 Batching is resume-safe: a run only gets marked "uploaded" in the manifest
 once its *batch's* zip is actually confirmed on the server. An interrupted
 partial batch just gets re-staged into a fresh batch on the next run — no
@@ -127,10 +156,11 @@ previews (name-substring match, case-insensitive), and `output.log`
   files, config, summary, and history. `wandb_ckpt_backup.py` covers
   *checkpoint* artifacts specifically as a separate pass; other artifact
   types are still a gap.
-- The SFTP account currently requires **TOTP two-factor authentication** in
-  addition to a password, which blocks fully unattended runs unless a
-  service account / app-specific password is set up on Semler's side, or
-  the TOTP secret (not just a rotating code) is captured.
+- The SFTP account requires **TOTP two-factor authentication** in addition
+  to a password. This is now handled automatically (see [SFTP two-factor
+  authentication](#sftp-two-factor-authentication) above) as long as
+  `SEMLER_SFTP_TOTP_SECRET` is set — unattended runs are blocked only until
+  that seed is captured and configured.
 
 ## Legacy: Google Drive migration
 

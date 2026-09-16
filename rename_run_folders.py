@@ -1,7 +1,8 @@
 import json
-from pathlib import Path
 
-PROJECT_FOLDER = Path("/home/ubuntu/wandb_backups/theta-tech-ai_semler-qfhd")
+import sftp_backup_lib as sftp_lib
+
+PROJECT_FOLDER = sftp_lib.resolve_backup_base() / "theta-tech-ai_semler-qfhd"
 MANIFEST_FILE = PROJECT_FOLDER / "backup_manifest.json"
 
 with open(MANIFEST_FILE) as f:

@@ -1,9 +1,9 @@
 # ============================================================
-# W&B → LOCAL DISK FULL BACKUP
+# W&B → LOCAL DISK BACKUP
 # STANDALONE PYTHON (run with the venv's python, e.g. in background)
 #
-# FULL PROJECT BACKUP
-# - All W&B runs
+# TARGET-LIST BACKUP
+# - Every run listed in ckpt_target_run_ids.txt (not the full project)
 # - Metadata / config / summary / history
 # - W&B run files
 # - Restart-safe local backup
@@ -128,6 +128,13 @@ BULK_ZIP_BATCH_SIZE = 10
 
 LOG_FILE = BACKUP_BASE / "backup_errors.log"
 MANIFEST_FILE = PROJECT_FOLDER / "backup_manifest.json"
+
+# Caches each target-list run's metadata/config/summary fetched from
+# W&B, so restarting the script doesn't re-fetch runs it already
+# knows about. Only ever grows: on each run, just the IDs newly
+# added to ckpt_target_run_ids.txt since the last cache get fetched
+# and appended - see GET TARGET-LIST RUNS below.
+RUN_LIST_CACHE_FILE = PROJECT_FOLDER / "run_list_cache.json"
 
 # Local-only lookup index: which bulk batch (if any) each run ended
 # up in. Never uploaded to SFTP - the manifest above already tracks
@@ -698,48 +705,101 @@ except Exception as e:
 
 
 # ============================================================
-# 8. GET ALL RUNS
+# 8. GET TARGET-LIST RUNS
+#
+# Only the runs curated in ckpt_target_run_ids.txt are backed up by
+# this pipeline - not the full project. Each is fetched individually
+# (api.run(), not the much slower full-project api.runs() listing)
+# and cached to disk, so a restart only has to fetch whatever run
+# IDs were newly added to the target list since the last cache.
 # ============================================================
 
+
+class _CachedRunProxy:
+    """Stands in for a wandb Run built from RUN_LIST_CACHE_FILE.
+
+    id/name/state/url/created_at/config/summary come straight from
+    the cache, no network involved. Anything else (run.files(),
+    run.scan_history(), ...) fetches the real wandb Run on first use
+    and delegates to it from then on - which only happens for runs
+    actually being processed, not the whole target list on every
+    restart."""
+
+    __slots__ = (
+        "_api", "_live", "_path", "config", "created_at",
+        "id", "name", "state", "summary", "url",
+    )
+
+    def __init__(self, api_handle, path, cached):
+        self.id = cached["id"]
+        self.name = cached["name"]
+        self.state = cached["state"]
+        self.url = cached["url"]
+        self.created_at = cached["created_at"]
+        self.config = cached["config"]
+        self.summary = cached["summary"]
+        self._api = api_handle
+        self._path = path
+        self._live = None
+
+    def __getattr__(self, item):
+        if self._live is None:
+            self._live = self._api.run(self._path)
+        return getattr(self._live, item)
+
+
+def _serialize_run_for_cache(run):
+    return {
+        "id": run.id,
+        "name": run.name,
+        "state": run.state,
+        "url": run.url,
+        "created_at": str(run.created_at),
+        "config": dict(run.config),
+        "summary": dict(run.summary),
+    }
+
+
+def _load_run_cache():
+    try:
+        with open(RUN_LIST_CACHE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("entity") == WANDB_ENTITY and data.get("project") == WANDB_PROJECT:
+            return data.get("runs", {})
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"⚠ Could not read run cache, ignoring it: {e}")
+    return {}
+
+
+def _save_run_cache(runs_by_id):
+    try:
+        RUN_LIST_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = RUN_LIST_CACHE_FILE.with_suffix(".json.tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "entity": WANDB_ENTITY,
+                    "project": WANDB_PROJECT,
+                    "runs": runs_by_id,
+                },
+                f,
+                default=str,
+            )
+        tmp_path.replace(RUN_LIST_CACHE_FILE)
+    except Exception as e:
+        print(f"⚠ Could not write run cache: {e}")
+
+
 print("\n" + "=" * 70)
-print("GETTING W&B RUNS")
+print("GETTING TARGET-LIST RUNS")
 print("=" * 70)
 
 print(
     f"\nProject: "
     f"{WANDB_ENTITY}/{WANDB_PROJECT}"
 )
-
-try:
-    start_get_runs = time.time()
-
-    runs = list(
-        api.runs(
-            f"{WANDB_ENTITY}/{WANDB_PROJECT}",
-            order="-created_at"
-        )
-    )
-
-    elapsed = time.time() - start_get_runs
-
-    print(
-        f"\n✓ Found {len(runs):,} total runs"
-    )
-
-    print(
-        f"Retrieval time: "
-        f"{format_seconds(elapsed)}"
-    )
-
-except Exception as e:
-    log_error(f"Could not retrieve W&B runs: {e}")
-    traceback.print_exc()
-    raise
-
-
-# ============================================================
-# 8b. PRIORITIZE TARGET-LIST RUNS
-# ============================================================
 
 target_ids = load_target_run_ids()
 target_set = set(target_ids)
@@ -749,22 +809,81 @@ print(
     f"(from {TARGET_RUN_IDS_FILE})"
 )
 
-if target_set:
-    runs_by_id = {r.id: r for r in runs}
-    target_runs = [runs_by_id[rid] for rid in target_ids if rid in runs_by_id]
-    missing_targets = [rid for rid in target_ids if rid not in runs_by_id]
-    other_runs = [r for r in runs if r.id not in target_set]
+if not target_ids:
+    print("\n✗ No target run IDs found - nothing to back up.")
+    raise SystemExit
 
-    runs = target_runs + other_runs
+cached_runs = _load_run_cache()
+to_fetch = [rid for rid in target_ids if rid not in cached_runs]
 
-    print(f"✓ {len(target_runs)} target runs moved to the front of the queue")
+print(
+    f"✓ {len(target_ids) - len(to_fetch)} run(s) loaded from cache "
+    f"({RUN_LIST_CACHE_FILE.name})"
+)
+
+missing_targets = []
+
+if to_fetch:
+    print(f"Fetching {len(to_fetch)} run(s) not yet cached...")
+
+    try:
+        start_get_runs = time.time()
+
+        def _fetch_one(rid):
+            try:
+                run = api.run(f"{WANDB_ENTITY}/{WANDB_PROJECT}/{rid}")
+                return rid, _serialize_run_for_cache(run), None
+            except Exception as e:
+                return rid, None, e
+
+        fetched_count = 0
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = [executor.submit(_fetch_one, rid) for rid in to_fetch]
+
+            for future in as_completed(futures):
+                rid, entry, err = future.result()
+                fetched_count += 1
+
+                if entry is not None:
+                    cached_runs[rid] = entry
+                else:
+                    missing_targets.append(rid)
+
+                if fetched_count % 100 == 0 or fetched_count == len(to_fetch):
+                    print(f"  {fetched_count}/{len(to_fetch)} fetched...")
+
+        elapsed = time.time() - start_get_runs
+
+        print(
+            f"✓ Fetched {len(to_fetch) - len(missing_targets)} run(s) "
+            f"in {format_seconds(elapsed)}"
+        )
+
+        _save_run_cache(cached_runs)
+        print(f"✓ Run cache updated ({RUN_LIST_CACHE_FILE.name})")
+
+    except Exception as e:
+        log_error(f"Could not fetch target-list runs: {e}")
+        traceback.print_exc()
+        raise
 
     if missing_targets:
         print(
-            f"⚠ {len(missing_targets)} target run IDs not found in this "
-            f"project: {missing_targets[:10]}"
+            f"⚠ {len(missing_targets)} target run IDs could not be fetched "
+            f"from W&B (deleted, or no access?): {missing_targets[:10]}"
             f"{' ...' if len(missing_targets) > 10 else ''}"
         )
+else:
+    print("✓ All target runs already cached, nothing new to fetch")
+
+runs = [
+    _CachedRunProxy(api, f"{WANDB_ENTITY}/{WANDB_PROJECT}/{rid}", cached_runs[rid])
+    for rid in target_ids
+    if rid in cached_runs
+]
+
+print(f"\n✓ {len(runs):,} target runs ready to process")
 
 
 # ============================================================
@@ -781,8 +900,8 @@ if MAX_RUNS is not None:
 
 else:
     print(
-        "\n✓ FULL BACKUP MODE: "
-        "all runs selected"
+        "\n✓ TARGET-LIST BACKUP MODE: "
+        "all target-list runs selected"
     )
 
 

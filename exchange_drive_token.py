@@ -1,10 +1,11 @@
 import json
 import urllib.request
 import urllib.parse
+from pathlib import Path
 
-CLIENT_CFG_PATH = "/home/ubuntu/.gdrive_oauth_client.json"
-CODE_PATH = "/home/ubuntu/.gdrive_auth_code.txt"
-TOKEN_OUT_PATH = "/home/ubuntu/.gdrive_token.json"
+CLIENT_CFG_PATH = str(Path.home() / ".gdrive_oauth_client.json")
+CODE_PATH = str(Path.home() / ".gdrive_auth_code.txt")
+TOKEN_OUT_PATH = str(Path.home() / ".gdrive_token.json")
 
 # This is the redirect_uri actually used for this particular
 # authorization request (OAuth Playground), which must match

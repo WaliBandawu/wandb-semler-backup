@@ -42,11 +42,11 @@ import sftp_backup_lib as sftp_lib
 WANDB_ENTITY = "theta-tech-ai"
 WANDB_PROJECT = "semler-qfhd"
 
-DRIVE_CLIENT_CFG_PATH = "/home/ubuntu/.gdrive_oauth_client.json"
-DRIVE_TOKEN_PATH = "/home/ubuntu/.gdrive_token.json"
+DRIVE_CLIENT_CFG_PATH = str(Path.home() / ".gdrive_oauth_client.json")
+DRIVE_TOKEN_PATH = str(Path.home() / ".gdrive_token.json")
 DRIVE_SHARED_DRIVE_ID = "0ANwW-EAug9vmUk9PVA"
 
-BACKUP_BASE = Path("/home/ubuntu/wandb_backups")
+BACKUP_BASE = sftp_lib.resolve_backup_base()
 MANIFEST_FILE = BACKUP_BASE / "drive_to_sftp_manifest.json"
 LOG_FILE = BACKUP_BASE / "drive_to_sftp_errors.log"
 STAGING_DIR = BACKUP_BASE / "_drive_to_sftp_staging"

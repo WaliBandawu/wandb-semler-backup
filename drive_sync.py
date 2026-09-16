@@ -12,10 +12,12 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 
-CLIENT_CFG_PATH = "/home/ubuntu/.gdrive_oauth_client.json"
-TOKEN_PATH = "/home/ubuntu/.gdrive_token.json"
+import sftp_backup_lib as sftp_lib
 
-LOCAL_ROOT = Path("/home/ubuntu/wandb_backups")
+CLIENT_CFG_PATH = str(Path.home() / ".gdrive_oauth_client.json")
+TOKEN_PATH = str(Path.home() / ".gdrive_token.json")
+
+LOCAL_ROOT = sftp_lib.resolve_backup_base()
 
 # Destination Shared Drive. Everything under LOCAL_ROOT is mirrored
 # directly under this Shared Drive's root.
