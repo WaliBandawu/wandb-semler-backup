@@ -5,11 +5,16 @@
 # wandb_ckpt_backup.py to upload backup files to the Semler SFTP
 # server, replacing the old Google Drive destination.
 #
-# Credentials are read from SFTP_CREDENTIALS_PATH (JSON file,
-# chmod 600, not committed anywhere) rather than hardcoded here.
+# Credentials come from environment variables (SEMLER_SFTP_HOST,
+# SEMLER_SFTP_PORT, SEMLER_SFTP_USERNAME, SEMLER_SFTP_PASSWORD - see
+# .env.example), loaded from a local .env file if one exists. Falls
+# back to the JSON file at SFTP_CREDENTIALS_PATH for the existing
+# server deployment, which already has that file in place. Neither
+# form is ever committed to this repo.
 # ============================================================
 
 import json
+import os
 import posixpath
 import stat as _stat
 import threading
@@ -18,6 +23,30 @@ import time
 import paramiko
 
 SFTP_CREDENTIALS_PATH = "/home/ubuntu/.semler_sftp_credentials.json"
+
+
+def _load_dotenv(path=".env"):
+    """Minimal .env loader: KEY=VALUE per line, '#' comments, blank
+    lines ignored. Doesn't overwrite variables already set in the
+    real environment - explicit `export`s always win over the file."""
+    if not os.path.exists(path):
+        return
+
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+
+            os.environ.setdefault(key, value)
+
+
+_load_dotenv()
 
 # Base remote directory backups are written under. Relative (no
 # leading slash) so it resolves against whatever home/default
@@ -37,8 +66,27 @@ _known_dirs_lock = threading.Lock()
 
 
 def _load_credentials():
-    with open(SFTP_CREDENTIALS_PATH) as f:
-        return json.load(f)
+    host = os.environ.get("SEMLER_SFTP_HOST")
+    username = os.environ.get("SEMLER_SFTP_USERNAME")
+    password = os.environ.get("SEMLER_SFTP_PASSWORD")
+
+    if host and username and password:
+        return {
+            "host": host,
+            "port": int(os.environ.get("SEMLER_SFTP_PORT", "22")),
+            "username": username,
+            "password": password,
+        }
+
+    try:
+        with open(SFTP_CREDENTIALS_PATH) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            "No SFTP credentials found. Set SEMLER_SFTP_HOST/"
+            "SEMLER_SFTP_USERNAME/SEMLER_SFTP_PASSWORD (e.g. via a "
+            f".env file - see .env.example) or provide {SFTP_CREDENTIALS_PATH}."
+        )
 
 
 def _connect():

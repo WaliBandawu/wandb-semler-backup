@@ -13,6 +13,7 @@ venv/
 *.pem
 *.key
 .netrc
+.env
 
 # Backup run artifacts, manifests, logs - generated, not source
 backup_manifest.json

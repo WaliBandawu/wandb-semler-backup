@@ -13,14 +13,14 @@ python3 -m venv venv
 source venv/bin/activate
 pip install wandb paramiko
 
-# W&B auth - either export WANDB_API_KEY, or `wandb login` once
-# (writes to ~/.netrc)
-
-# SFTP credentials - JSON file, chmod 600, NOT committed to this repo:
-#   {"host": "files.semlerscientific.net", "port": 22,
-#    "username": "...", "password": "..."}
-# Path is set by SFTP_CREDENTIALS_PATH in sftp_backup_lib.py
-# (defaults to /home/ubuntu/.semler_sftp_credentials.json)
+cp .env.example .env
+# then fill in .env with real values:
+#   WANDB_API_KEY=...            (or skip this and `wandb login` once instead)
+#   SEMLER_SFTP_HOST=files.semlerscientific.net
+#   SEMLER_SFTP_PORT=22
+#   SEMLER_SFTP_USERNAME=...
+#   SEMLER_SFTP_PASSWORD=...
+# .env is gitignored - it never gets committed.
 
 python3 wandb_backup_parallel.py
 ```
@@ -28,11 +28,16 @@ python3 wandb_backup_parallel.py
 Safe to stop (Ctrl+C) and rerun at any time — it picks up exactly where it
 left off.
 
+If `SEMLER_SFTP_*` isn't set, `sftp_backup_lib.py` falls back to reading a
+JSON credentials file (`{"host", "port", "username", "password"}`) from
+`SFTP_CREDENTIALS_PATH` — the existing method on the server this already
+runs on. `.env` is the easier path for a fresh checkout.
+
 ## Scripts
 
 | Script | Purpose |
 |---|---|
-| `wandb_backup_parallel.py` | **Main entry point.** Full project backup, 12 concurrent workers. See [Design](#design) below. |
+| `wandb_backup_parallel.py` | **Main entry point.** Full project backup, concurrent workers scaled to the machine it runs on. See [Design](#design) below. |
 | `wandb_backup_local.py` | Same backup logic, sequential (single-threaded). Useful for debugging without concurrency noise. |
 | `wandb_backup_colab.py` | Same again, tuned for running in a Google Colab notebook cell. |
 | `wandb_ckpt_backup.py` | Checkpoint-only pass: downloads/uploads `model`-type logged artifacts (`.ckpt` files) for runs listed in `ckpt_target_run_ids.txt`. Every other run is only checked for *whether* it has checkpoints (recorded in its own manifest), never downloaded. |
@@ -71,8 +76,12 @@ files are retried.
 
 ### Concurrency
 
-`wandb_backup_parallel.py` runs 12 worker threads (`MAX_WORKERS`) via
-`ThreadPoolExecutor`. Each worker owns its own SFTP connection
+`wandb_backup_parallel.py` runs multiple worker threads (`MAX_WORKERS`) via
+`ThreadPoolExecutor`. This work is I/O-bound (network waits, not CPU), so
+`MAX_WORKERS` is computed from the machine it runs on —
+`min(32, os.cpu_count() + 4)`, the same formula Python's own
+`ThreadPoolExecutor` uses by default for exactly this case — rather than a
+number tuned for one specific box. Each worker owns its own SFTP connection
 (`paramiko` clients aren't thread-safe); the manifest is protected by a
 lock and only ever mutated by the thread that owns a given run's record.
 
