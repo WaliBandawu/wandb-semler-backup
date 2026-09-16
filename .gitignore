@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Claude Code session state - not part of the project
+.claude/
+
+# Credentials - never committed, always loaded from an external path
+*.credentials.json
+*credentials*.json
+*.pem
+*.key
+.netrc
+
+# Backup run artifacts, manifests, logs - generated, not source
+backup_manifest.json
+ckpt_manifest.json
+bulk_batch_registry.json
+*.log
