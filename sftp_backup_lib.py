@@ -13,6 +13,7 @@
 # form is ever committed to this repo.
 # ============================================================
 
+import hashlib
 import json
 import os
 import posixpath
@@ -187,6 +188,10 @@ def get_sftp_client():
     return sftp
 
 
+RETRY_BACKOFF_SECONDS_PER_ATTEMPT = 5
+SFTP_RETRY_BACKOFF_CAP_SECONDS = 20
+
+
 def with_sftp_retry(fn, *args, retries=3, **kwargs):
     """Run fn(sftp, *args, **kwargs), retrying once more with a fresh
     connection if the first attempt fails on a connection-shaped error."""
@@ -207,7 +212,10 @@ def with_sftp_retry(fn, *args, retries=3, **kwargs):
             _thread_local.sftp = None
 
             if attempt < retries:
-                time.sleep(min(5 * attempt, 20))
+                time.sleep(min(
+                    RETRY_BACKOFF_SECONDS_PER_ATTEMPT * attempt,
+                    SFTP_RETRY_BACKOFF_CAP_SECONDS
+                ))
 
     raise last_error
 
@@ -392,13 +400,21 @@ def sftp_run_complete_safe(run_id, project_remote_dir, expected, log_error=None)
         return False
 
 
+def resolve_remote_dir_under_root(*name_parts):
+    """Resolve (and cache) <SFTP_REMOTE_ROOT>/<name_parts...>, sanitizing
+    each part. Generic version of resolve_project_remote_dir below,
+    for backups that aren't shaped like entity/project (e.g. a single
+    named folder mirrored from Google Drive)."""
+    sftp = get_sftp_client()
+    remote_dir = remote_join(SFTP_REMOTE_ROOT, *(safe_name(p) for p in name_parts))
+    ensure_remote_dir(sftp, remote_dir)
+    return remote_dir
+
+
 def resolve_project_remote_dir(entity, project):
     """Resolve (and cache) the shared <root>/entity/project directory
     chain once, before any worker threads start."""
-    sftp = get_sftp_client()
-    remote_dir = remote_join(SFTP_REMOTE_ROOT, safe_name(entity), safe_name(project))
-    ensure_remote_dir(sftp, remote_dir)
-    return remote_dir
+    return resolve_remote_dir_under_root(entity, project)
 
 
 def resolve_bulk_batch_remote_dir(project_remote_dir):
@@ -410,3 +426,118 @@ def resolve_bulk_batch_remote_dir(project_remote_dir):
     remote_dir = remote_join(project_remote_dir, "bulk_batches")
     ensure_remote_dir(sftp, remote_dir)
     return remote_dir
+
+
+# ============================================================
+# W&B CHECKPOINT ARTIFACT DOWNLOAD
+#
+# Not SFTP-specific, but shared by wandb_backup_parallel.py and
+# wandb_ckpt_backup.py - the only module both already import - so
+# this "download every model artifact for a run" logic lives in one
+# place instead of two near-identical copies.
+# ============================================================
+
+ARTIFACT_DOWNLOAD_MAX_RETRIES = 3
+ARTIFACT_DOWNLOAD_BACKOFF_SECONDS_PER_ATTEMPT = 5
+ARTIFACT_DOWNLOAD_BACKOFF_CAP_SECONDS = 30
+
+
+def sha256_file(path, chunk_size=8 * 1024 * 1024):
+    """Calculate SHA-256 for a local file - used for backup integrity
+    verification."""
+    digest = hashlib.sha256()
+
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+
+def download_model_artifacts(run, dest_root, existing_artifacts=None):
+    """Downloads every 'model'-type logged artifact for `run` into
+    dest_root/<artifact-dirname>/..., retrying failed downloads and
+    skipping artifacts already fully present on disk (restart-safe).
+    Every downloaded file is hashed for backup integrity checks.
+
+    Returns (artifacts_record, any_failed). Raises RuntimeError if the
+    artifact list itself couldn't be fetched - the caller decides how
+    that failure should be recorded (manifest shape differs between
+    callers, so that's left to them).
+
+    `existing_artifacts` (optional): a previous run's artifact record
+    dict, reused as-is for artifacts found already downloaded so their
+    aliases/file hashes aren't lost across restarts."""
+    existing_artifacts = existing_artifacts or {}
+
+    try:
+        model_artifacts = [a for a in run.logged_artifacts() if a.type == "model"]
+    except Exception as e:
+        raise RuntimeError(f"could not list checkpoint artifacts: {e}") from e
+
+    artifacts_record = {}
+    any_failed = False
+
+    for artifact in model_artifacts:
+        artifact_dirname = artifact.name.replace(":", "_v")
+        dest_dir = dest_root / artifact_dirname
+
+        if dest_dir.exists() and any(p.is_file() for p in dest_dir.rglob("*")):
+            print(f"  ↪ SKIP: {artifact.name} (already downloaded)")
+            artifacts_record[artifact.name] = existing_artifacts.get(
+                artifact.name,
+                {"status": "downloaded", "aliases": artifact.aliases}
+            )
+            continue
+
+        downloaded = False
+        last_error = None
+
+        for attempt in range(1, ARTIFACT_DOWNLOAD_MAX_RETRIES + 1):
+            print(
+                f"  ↓ Downloading checkpoint: {artifact.name}"
+                f" [attempt {attempt}/{ARTIFACT_DOWNLOAD_MAX_RETRIES}]"
+            )
+
+            try:
+                artifact.download(root=str(dest_dir))
+                downloaded = True
+                break
+            except Exception as e:
+                last_error = e
+                print(f"  ✗ Attempt {attempt} failed: {e}")
+
+                if attempt < ARTIFACT_DOWNLOAD_MAX_RETRIES:
+                    time.sleep(min(
+                        ARTIFACT_DOWNLOAD_BACKOFF_SECONDS_PER_ATTEMPT * attempt,
+                        ARTIFACT_DOWNLOAD_BACKOFF_CAP_SECONDS
+                    ))
+
+        if not downloaded:
+            artifacts_record[artifact.name] = {
+                "status": "failed",
+                "error": str(last_error)
+            }
+            any_failed = True
+            continue
+
+        files_info = {}
+        for f in sorted(dest_dir.rglob("*")):
+            if f.is_file():
+                files_info[str(f.relative_to(dest_dir))] = {
+                    "size": f.stat().st_size,
+                    "sha256": sha256_file(f),
+                }
+
+        artifacts_record[artifact.name] = {
+            "status": "downloaded",
+            "aliases": artifact.aliases,
+            "files": files_info,
+        }
+
+        print(f"  ✓ COMPLETE: {artifact.name}")
+
+    return artifacts_record, any_failed

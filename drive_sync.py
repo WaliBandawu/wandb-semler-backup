@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import sys
@@ -74,8 +75,6 @@ def load_manifest():
 
 
 def save_manifest(manifest):
-    import copy
-
     with MANIFEST_LOCK:
         snapshot = copy.deepcopy(manifest)
 

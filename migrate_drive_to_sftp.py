@@ -18,6 +18,7 @@
 # saving the manifest).
 # ============================================================
 
+import copy
 import io
 import json
 import os
@@ -99,8 +100,6 @@ def load_manifest():
 
 
 def save_manifest(manifest):
-    import copy
-
     with MANIFEST_LOCK:
         manifest["updated_at"] = datetime.now().isoformat()
         snapshot = copy.deepcopy(manifest)

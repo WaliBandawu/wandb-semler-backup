@@ -28,7 +28,6 @@ import copy
 import time
 import shutil
 import traceback
-import hashlib
 import threading
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -155,6 +154,11 @@ TARGET_RUN_IDS_FILE = Path(__file__).resolve().parent / "ckpt_target_run_ids.txt
 
 # Number of retries for a failed W&B file download
 MAX_FILE_RETRIES = 3
+
+# Backoff between file/checkpoint download retries: attempt * this,
+# capped at this - e.g. 5s, 10s, then capped at 30s from then on.
+RETRY_BACKOFF_SECONDS_PER_ATTEMPT = 5
+RETRY_BACKOFF_CAP_SECONDS = 30
 
 # Media files whose name contains any of these (case-insensitive)
 # are skipped entirely for every run - not downloaded, and
@@ -330,24 +334,7 @@ def log(message):
         print(message)
 
 
-def sha256_file(path, chunk_size=8 * 1024 * 1024):
-    """
-    Calculate SHA-256 for a local file.
-
-    Used for our own backup integrity verification.
-    """
-    digest = hashlib.sha256()
-
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-
-            if not chunk:
-                break
-
-            digest.update(chunk)
-
-    return digest.hexdigest()
+sha256_file = sftp_lib.sha256_file
 
 
 def safe_name(name):
@@ -1122,8 +1109,8 @@ def download_wandb_file(
 
                 # Short backoff before retry.
                 sleep_seconds = min(
-                    5 * attempt,
-                    30
+                    RETRY_BACKOFF_SECONDS_PER_ATTEMPT * attempt,
+                    RETRY_BACKOFF_CAP_SECONDS
                 )
 
                 print(
@@ -1169,86 +1156,26 @@ def download_wandb_file(
 
 def download_run_checkpoints(run, run_folder, run_record):
     checkpoints_folder = run_folder / "checkpoints"
+    existing_artifacts = run_record.get("checkpoints", {}).get("artifacts", {})
 
     try:
-        model_artifacts = [
-            a for a in run.logged_artifacts() if a.type == "model"
-        ]
-    except Exception as e:
-        log_error(f"Run {run.id}: could not list checkpoint artifacts: {e}")
+        artifacts_record, any_failed = sftp_lib.download_model_artifacts(
+            run, checkpoints_folder, existing_artifacts=existing_artifacts
+        )
+    except RuntimeError as e:
+        log_error(f"Run {run.id}: {e}")
         run_record["checkpoints"] = {"status": "failed", "error": str(e)}
         return
 
-    if not model_artifacts:
-        run_record["checkpoints"] = {"status": "complete", "artifacts": {}}
+    if not artifacts_record:
         print("- No checkpoint (model) artifacts found")
-        return
 
-    existing_artifacts = run_record.get("checkpoints", {}).get("artifacts", {})
-    artifacts_record = {}
-    any_failed = False
-
-    for artifact in model_artifacts:
-        artifact_dirname = artifact.name.replace(":", "_v")
-        dest_dir = checkpoints_folder / artifact_dirname
-
-        if dest_dir.exists() and any(
-            p.is_file() for p in dest_dir.rglob("*")
-        ):
-            print(f"  ↪ SKIP: {artifact.name} (already downloaded)")
-            artifacts_record[artifact.name] = existing_artifacts.get(
-                artifact.name,
-                {"status": "downloaded", "aliases": artifact.aliases}
-            )
-            continue
-
-        downloaded = False
-        last_error = None
-
-        for attempt in range(1, MAX_FILE_RETRIES + 1):
-            print(
-                f"  ↓ Downloading checkpoint: {artifact.name}"
-                f" [attempt {attempt}/{MAX_FILE_RETRIES}]"
-            )
-
-            try:
-                artifact.download(root=str(dest_dir))
-                downloaded = True
-                break
-            except Exception as e:
-                last_error = e
-                print(f"  ✗ Attempt {attempt} failed: {e}")
-
-                if attempt < MAX_FILE_RETRIES:
-                    time.sleep(min(5 * attempt, 30))
-
-        if not downloaded:
+    for artifact_name, info in artifacts_record.items():
+        if info.get("status") == "failed":
             log_error(
-                f"Run {run.id}: checkpoint artifact {artifact.name} "
-                f"download failed: {last_error}"
+                f"Run {run.id}: checkpoint artifact {artifact_name} "
+                f"download failed: {info.get('error')}"
             )
-            artifacts_record[artifact.name] = {
-                "status": "failed",
-                "error": str(last_error)
-            }
-            any_failed = True
-            continue
-
-        files_info = {}
-        for f in sorted(dest_dir.rglob("*")):
-            if f.is_file():
-                files_info[str(f.relative_to(dest_dir))] = {
-                    "size": f.stat().st_size,
-                    "sha256": sha256_file(f),
-                }
-
-        artifacts_record[artifact.name] = {
-            "status": "downloaded",
-            "aliases": artifact.aliases,
-            "files": files_info,
-        }
-
-        print(f"  ✓ COMPLETE: {artifact.name}")
 
     run_record["checkpoints"] = {
         "status": "incomplete" if any_failed else "complete",
@@ -1258,7 +1185,7 @@ def download_run_checkpoints(run, run_folder, run_record):
     print(
         f"Checkpoint artifacts: "
         f"{sum(1 for a in artifacts_record.values() if a.get('status') != 'failed')}"
-        f"/{len(model_artifacts)} downloaded"
+        f"/{len(artifacts_record)} downloaded"
     )
 
 
@@ -1513,6 +1440,98 @@ def _save_run_component(run, run_record, component, path, build_data):
         log_error(f"Run {run.id}: {component} failed: {e}")
 
 
+def save_run_history(run, run_folder, run_record):
+    history_path = run_folder / "history.csv"
+
+    try:
+        # If the history file already exists, we still refresh it
+        # because W&B history can contain the complete run history.
+        history = list(run.scan_history())
+
+        if not history:
+            run_record["history"] = {
+                "status": "complete",
+                "rows": 0,
+                "path": str(history_path)
+            }
+            print("- No history data found")
+            return
+
+        columns = sorted({key for row in history for key in row})
+
+        temp_history = run_folder / "history.csv.tmp"
+
+        with open(temp_history, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+            writer.writeheader()
+            for row in history:
+                writer.writerow(row)
+
+        temp_history.replace(history_path)
+
+        run_record["history"] = {
+            "status": "complete",
+            "rows": len(history),
+            "path": str(history_path)
+        }
+
+        print(f"✓ history.csv ({len(history):,} rows)")
+
+    except Exception as e:
+        run_record["history"] = {"status": "failed", "error": str(e)}
+        log_error(f"Run {run.id}: history failed: {e}")
+
+
+def download_run_files(run, files_folder, run_record, is_target=False):
+    successful_files = 0
+    skipped_files = 0
+    failed_files = 0
+
+    try:
+        run_files = list(run.files())
+        total_files = len(run_files)
+
+        print(f"Found {total_files} W&B files")
+
+        for file_number, wandb_file in enumerate(run_files, start=1):
+            filename = wandb_file.name
+
+            print(f"\n  File {file_number}/{total_files}")
+
+            if is_excluded_media_file(filename, is_target=is_target):
+                print(
+                    f"  ↪ SKIP: {filename}"
+                    " (excluded: occlusion/gradcam/log/non-top-run scatter)"
+                )
+                run_record["files"][filename] = {
+                    "status": "excluded",
+                    "path": None,
+                    "size": None,
+                    "sha256": None
+                }
+                continue
+
+            result = download_wandb_file(wandb_file, files_folder, run.id)
+
+            # Save progress immediately.
+            run_record["files"][filename] = result
+
+            if result["status"] == "downloaded":
+                successful_files += 1
+            elif result["status"] == "skipped":
+                skipped_files += 1
+            else:
+                failed_files += 1
+
+        print(f"\nFiles downloaded: {successful_files}")
+        print(f"Files skipped: {skipped_files}")
+        print(f"Files failed: {failed_files}")
+
+    except Exception as e:
+        log_error(f"Run {run.id}: could not retrieve run files: {e}")
+        run_record["files_error"] = str(e)
+
+
 def backup_run_download(run, run_folder, files_folder, run_record, is_target=False):
     # ========================================================
     # METADATA
@@ -1567,90 +1586,7 @@ def backup_run_download(run, run_folder, files_folder, run_record, is_target=Fal
 
     print("\n[4/6] Run history")
 
-    history_path = (
-        run_folder / "history.csv"
-    )
-
-    try:
-
-        # If the history file already exists, we still
-        # refresh it because W&B history can contain
-        # the complete run history.
-        history = list(
-            run.scan_history()
-        )
-
-        if history:
-
-            columns = set()
-
-            for row in history:
-                columns.update(
-                    row.keys()
-                )
-
-            columns = sorted(columns)
-
-            temp_history = (
-                run_folder / "history.csv.tmp"
-            )
-
-            with open(
-                temp_history,
-                "w",
-                newline="",
-                encoding="utf-8"
-            ) as f:
-
-                writer = csv.DictWriter(
-                    f,
-                    fieldnames=columns,
-                    extrasaction="ignore"
-                )
-
-                writer.writeheader()
-
-                for row in history:
-                    writer.writerow(row)
-
-            temp_history.replace(
-                history_path
-            )
-
-            run_record["history"] = {
-                "status": "complete",
-                "rows": len(history),
-                "path": str(history_path)
-            }
-
-            print(
-                f"✓ history.csv "
-                f"({len(history):,} rows)"
-            )
-
-        else:
-
-            run_record["history"] = {
-                "status": "complete",
-                "rows": 0,
-                "path": str(history_path)
-            }
-
-            print(
-                "- No history data found"
-            )
-
-    except Exception as e:
-
-        run_record["history"] = {
-            "status": "failed",
-            "error": str(e)
-        }
-
-        log_error(
-            f"Run {run.id}: "
-            f"history failed: {e}"
-        )
+    save_run_history(run, run_folder, run_record)
 
     # ========================================================
     # W&B RUN FILES
@@ -1658,99 +1594,7 @@ def backup_run_download(run, run_folder, files_folder, run_record, is_target=Fal
 
     print("\n[5/6] W&B run files")
 
-    successful_files = 0
-    skipped_files = 0
-    failed_files = 0
-
-    try:
-
-        run_files = list(
-            run.files()
-        )
-
-        total_files = len(
-            run_files
-        )
-
-        print(
-            f"Found {total_files} W&B files"
-        )
-
-        for file_number, wandb_file in enumerate(
-            run_files,
-            start=1
-        ):
-
-            filename = wandb_file.name
-
-            print(
-                f"\n  File "
-                f"{file_number}/{total_files}"
-            )
-
-            if is_excluded_media_file(filename, is_target=is_target):
-
-                print(
-                    f"  ↪ SKIP: {filename}"
-                    " (excluded: occlusion/gradcam/log/non-top-run scatter)"
-                )
-
-                result = {
-                    "status": "excluded",
-                    "path": None,
-                    "size": None,
-                    "sha256": None
-                }
-
-                run_record["files"][
-                    filename
-                ] = result
-
-                continue
-
-            result = download_wandb_file(
-                wandb_file,
-                files_folder,
-                run.id
-            )
-
-            # Save progress immediately.
-            run_record["files"][
-                filename
-            ] = result
-
-            if result["status"] == "downloaded":
-                successful_files += 1
-
-            elif result["status"] == "skipped":
-                skipped_files += 1
-
-            else:
-                failed_files += 1
-
-        print(
-            f"\nFiles downloaded: "
-            f"{successful_files}"
-        )
-
-        print(
-            f"Files skipped: "
-            f"{skipped_files}"
-        )
-
-        print(
-            f"Files failed: "
-            f"{failed_files}"
-        )
-
-    except Exception as e:
-
-        log_error(
-            f"Run {run.id}: "
-            f"could not retrieve run files: {e}"
-        )
-
-        run_record["files_error"] = str(e)
+    download_run_files(run, files_folder, run_record, is_target=is_target)
 
     # ========================================================
     # CHECKPOINTS

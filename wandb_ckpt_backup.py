@@ -17,13 +17,12 @@
 # Restart-safe via its own manifest (ckpt_manifest.json).
 # ============================================================
 
+import copy
 import json
 import os
 import shutil
 import threading
-import time
 import traceback
-import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
@@ -80,17 +79,6 @@ def log_error(message):
         log("⚠ Could not write to error log")
 
 
-def sha256_file(path, chunk_size=8 * 1024 * 1024):
-    digest = hashlib.sha256()
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def save_json(data, path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -123,8 +111,6 @@ def load_manifest():
 
 
 def save_manifest(manifest):
-    import copy
-
     with MANIFEST_LOCK:
         manifest["updated_at"] = datetime.now().isoformat()
         snapshot = copy.deepcopy(manifest)
@@ -194,66 +180,40 @@ def backup_run_checkpoints(run_id, index, total, manifest):
             save_manifest(manifest)
         return {"run_id": run_id, "status": "failed"}
 
+    run_staging = CKPT_STAGING / run_id / "checkpoints"
+    run_staging.mkdir(parents=True, exist_ok=True)
+
     try:
-        model_artifacts = [a for a in run.logged_artifacts() if a.type == "model"]
-    except Exception as e:
-        log_error(f"Run {run_id}: could not list artifacts: {e}")
+        artifacts_record, any_failed = sftp_lib.download_model_artifacts(
+            run, run_staging,
+            existing_artifacts=(existing or {}).get("artifacts", {})
+        )
+    except RuntimeError as e:
+        log_error(f"Run {run_id}: {e}")
         record["status"] = "failed"
-        record["error"] = f"artifact list failed: {e}"
+        record["error"] = str(e)
         with MANIFEST_LOCK:
             manifest["runs"][run_id] = record
             save_manifest(manifest)
         return {"run_id": run_id, "status": "failed"}
 
-    if not model_artifacts:
+    record["artifacts"] = artifacts_record
+
+    if not artifacts_record:
         log(f"[{index}/{total}] {run_id}: no checkpoint (model) artifacts found")
         record["status"] = "complete"
-        record["artifacts"] = {}
         record["note"] = "no model artifacts on this run"
         with MANIFEST_LOCK:
             manifest["runs"][run_id] = record
             save_manifest(manifest)
         return {"run_id": run_id, "status": "complete"}
 
-    run_staging = CKPT_STAGING / run_id / "checkpoints"
-    run_staging.mkdir(parents=True, exist_ok=True)
-
-    any_failed = False
-
-    for artifact in model_artifacts:
-        artifact_dirname = f"{artifact.name.replace(':', '_v')}"
-        dest_dir = run_staging / artifact_dirname
-
-        for attempt in range(1, 4):
-            try:
-                log(f"  ↓ [{run_id}] downloading artifact {artifact.name} (attempt {attempt}/3)")
-                artifact.download(root=str(dest_dir))
-                break
-            except Exception as e:
-                log(f"  ✗ [{run_id}] {artifact.name} attempt {attempt} failed: {e}")
-                if attempt == 3:
-                    log_error(f"Run {run_id}: artifact {artifact.name} download failed: {e}")
-                    record["artifacts"][artifact.name] = {"status": "failed", "error": str(e)}
-                    any_failed = True
-                else:
-                    time.sleep(5 * attempt)
-                continue
-        else:
-            continue
-
-        files_info = {}
-        for f in sorted(dest_dir.rglob("*")):
-            if f.is_file():
-                files_info[str(f.relative_to(dest_dir))] = {
-                    "size": f.stat().st_size,
-                    "sha256": sha256_file(f),
-                }
-
-        record["artifacts"][artifact.name] = {
-            "status": "downloaded",
-            "aliases": artifact.aliases,
-            "files": files_info,
-        }
+    for artifact_name, info in artifacts_record.items():
+        if info.get("status") == "failed":
+            log_error(
+                f"Run {run_id}: artifact {artifact_name} download "
+                f"failed: {info.get('error')}"
+            )
 
     if run_staging.exists() and any(run_staging.iterdir()):
         log(f"  [SFTP] uploading checkpoints for {run_id}...")

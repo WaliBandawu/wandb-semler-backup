@@ -3,8 +3,11 @@
 Backs up the curated [target-list runs](#ckpt_target_run_idstxt) from the
 `theta-tech-ai/semler-qfhd` Weights & Biases project (metadata, config,
 summary, history, and run files) to Semler Scientific's SFTP server, with a
-fully restart-safe, resumable design. Originally targeted Google Drive as
-the destination; that's now legacy (see [Legacy: Google Drive
+fully restart-safe, resumable design. There's also a script for backing up
+a Google Drive **folder** to the same server (see [Google Drive folder
+backup](#google-drive-folder-backup) below) - unrelated to how W&B backups
+originally targeted Google Drive as their destination before moving to
+SFTP, which is now legacy (see [Legacy: Google Drive
 migration](#legacy-google-drive-migration) below).
 
 ## Quick start
@@ -12,7 +15,7 @@ migration](#legacy-google-drive-migration) below).
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-pip install wandb paramiko pyotp
+pip install wandb paramiko pyotp google-api-python-client google-auth google-auth-oauthlib
 
 cp .env.example .env
 # then fill in .env with real values:
@@ -65,8 +68,11 @@ service account/app-specific credential exempt from interactive 2FA.
 | `wandb_backup_colab.py` | Same again, tuned for running in a Google Colab notebook cell. Still does a full-project backup - not yet updated to the target-list-only scope above. |
 | `wandb_ckpt_backup.py` | Separate, broader checkpoint pass: like `wandb_backup_parallel.py`, downloads/uploads `model`-type logged artifacts for target-list runs, but also walks every *other* run in the full project and checks (never downloads) whether it has checkpoints, recording that fact in its own manifest. Redundant with `wandb_backup_parallel.py` for target-list runs specifically; still useful for that full-project checkpoint-presence sweep. |
 | `sftp_backup_lib.py` | Shared SFTP helpers (connection pooling, retry, atomic upload, remote directory resolution) used by the backup scripts above. |
-| `migrate_drive_to_sftp.py` | One-time migration: copies the old Google-Drive-backed tree to SFTP without re-touching W&B. |
-| `drive_sync.py` / `exchange_drive_token.py` | Legacy Google Drive sync + OAuth token exchange, superseded by the SFTP destination. Kept for reference / in case Drive is ever needed again. |
+| `drive_backup_to_sftp.py` | Backs up a Google Drive **folder** (not a W&B project) to SFTP, under `HD_Data/asset_archive/<drive folder's own name>/`. See [Google Drive folder backup](#google-drive-folder-backup) below. |
+| `gdrive_lib.py` | Shared Google Drive OAuth/API-client helper used by `drive_backup_to_sftp.py`, `migrate_drive_to_sftp.py`, and `drive_sync.py`. |
+| `exchange_drive_token.py` | One-time OAuth helper: exchanges an authorization code for the long-lived refresh token the Drive scripts above need. See [Google Drive folder backup](#google-drive-folder-backup) below. |
+| `migrate_drive_to_sftp.py` | One-time migration: copies the old Google-Drive-backed W&B-runs tree to SFTP without re-touching W&B. |
+| `drive_sync.py` | Legacy Google Drive sync (the other direction: local → Drive), superseded by the SFTP destination. Kept for reference. |
 | `rename_run_folders.py` | One-off utility to rename old manifest-tracked folders to their run ID. |
 
 ## `ckpt_target_run_ids.txt`
@@ -165,9 +171,98 @@ previews (name-substring match, case-insensitive), and `output.log`
   `SEMLER_SFTP_TOTP_SECRET` is set — unattended runs are blocked only until
   that seed is captured and configured.
 
+## Google Drive folder backup
+
+`drive_backup_to_sftp.py` backs up an arbitrary Google Drive **folder**
+(not a W&B project) to the same SFTP server, landing at
+`HD_Data/asset_archive/<the Drive folder's own name>/` — a sibling of the
+`W&B Runs` tree the other scripts use, under the same `asset_archive` root.
+It currently points at one folder, configured as `DRIVE_FOLDER_ID` near the
+top of the script:
+
+```
+https://drive.google.com/drive/folders/1zgbI4HtAh4L5VsbEGVeF9fSUylAVhvLx
+```
+
+(Currently resolves to a folder named "QFHD".) Like the W&B pipeline, it's
+restart-safe (`drive_folder_backup_manifest.json`) and uses [bulk zip
+batching](#bulk-zip-batching) — downloaded files accumulate locally and get
+zipped into batches of `BULK_ZIP_BATCH_SIZE` (10) before upload, instead of
+one SFTP round-trip per (often small) file.
+
+```bash
+python3 drive_backup_to_sftp.py
+```
+
+### One-time setup: Google Drive OAuth
+
+The Drive scripts (`drive_backup_to_sftp.py`, `migrate_drive_to_sftp.py`,
+`drive_sync.py`) authenticate via a long-lived OAuth refresh token stored
+locally, never committed to this repo:
+
+- `~/.gdrive_oauth_client.json` — `{"client_id", "client_secret", "token_uri"}`
+- `~/.gdrive_token.json` — the refresh token, produced by the exchange below
+
+To set these up from scratch:
+
+1. **Create a Google Cloud OAuth client.**
+   - [console.cloud.google.com](https://console.cloud.google.com) → pick or
+     create a project.
+   - **APIs & Services → Library** → search "Google Drive API" → **Enable**.
+   - **APIs & Services → OAuth consent screen** — if not already configured,
+     set it to "External," fill in the minimum (app name, your email), and
+     add your own Google account as a **test user** (the app can stay in
+     "Testing" status — that's fine for personal/internal use).
+   - **APIs & Services → Credentials → Create Credentials → OAuth client
+     ID**.
+     - Application type: **Web application** (must be Web, not Desktop —
+       needed to set a fixed custom redirect URI next).
+     - Under **Authorized redirect URIs**, add exactly:
+       `https://developers.google.com/oauthplayground`
+     - Save it, and copy the **Client ID** and **Client Secret**.
+
+2. **Save the client config locally:**
+
+   ```bash
+   cat > ~/.gdrive_oauth_client.json << 'EOF'
+   {"client_id": "YOUR_CLIENT_ID", "client_secret": "YOUR_CLIENT_SECRET", "token_uri": "https://oauth2.googleapis.com/token"}
+   EOF
+   chmod 600 ~/.gdrive_oauth_client.json
+   ```
+
+3. **Get a one-time authorization code via OAuth Playground:**
+   - Go to [developers.google.com/oauthplayground](https://developers.google.com/oauthplayground).
+   - Click the **gear icon** (top right) → check **"Use your own OAuth
+     credentials"** → paste in your Client ID and Client Secret.
+   - If there's an **"Auto-exchange authorization code for tokens"**
+     checkbox, **uncheck it** — otherwise Playground consumes the code
+     automatically and you can't grab it.
+   - In the left panel (Step 1), under "Input your own scopes," enter:
+     `https://www.googleapis.com/auth/drive` → click **Authorize APIs**.
+   - Log in with the Google account that has access to the target Drive
+     folder, and grant access.
+   - You'll land on Step 2, showing the raw authorization code — copy it.
+     **It expires in a few minutes**, so move to the next step right away.
+
+4. **Exchange the code for a refresh token:**
+
+   ```bash
+   echo -n "PASTE_THE_CODE_HERE" > ~/.gdrive_auth_code.txt
+   chmod 600 ~/.gdrive_auth_code.txt
+   python3 exchange_drive_token.py
+   # on success, saves ~/.gdrive_token.json and prints "Refresh token saved: yes"
+   rm ~/.gdrive_auth_code.txt   # one-time use, no longer needed
+   ```
+
+The refresh token doesn't expire from normal use, so this is a one-time
+setup — `gdrive_lib.get_drive_service()` refreshes the access token
+automatically on every run after this.
+
 ## Legacy: Google Drive migration
 
 Backups originally went to a Google Drive Shared Drive. That's since moved
 to the Semler SFTP server; `migrate_drive_to_sftp.py` was a one-time script
 to copy the already-backed-up Drive content over without re-hitting the W&B
-API. `drive_sync.py` and `exchange_drive_token.py` remain for reference.
+API. `drive_sync.py` remains for reference. (`exchange_drive_token.py`
+itself isn't legacy - see [Google Drive folder
+backup](#google-drive-folder-backup) above, which still needs it.)
