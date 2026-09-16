@@ -111,9 +111,7 @@ WANDB_PROJECT = "semler-qfhd"
 # None = ALL RUNS
 MAX_RUNS = None
 
-BACKUP_BASE = Path(
-    "/home/ubuntu/wandb_backups"
-)
+BACKUP_BASE = sftp_lib.resolve_backup_base()
 
 PROJECT_FOLDER = (
     BACKUP_BASE / f"{WANDB_ENTITY}_{WANDB_PROJECT}"

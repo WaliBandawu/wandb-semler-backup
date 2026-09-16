@@ -41,9 +41,18 @@ WANDB_PROJECT = "semler-qfhd"
 # None = ALL RUNS
 MAX_RUNS = None
 
-BACKUP_BASE = Path(
-    "/home/ubuntu/wandb_backups"
-)
+def _resolve_backup_base():
+    """BACKUP_BASE_DIR wins when set. Otherwise defaults to a
+    wandb_backups/ folder next to this file, so it works on whatever
+    machine the script is checked out on without editing code."""
+    override = os.environ.get("BACKUP_BASE_DIR")
+    if override:
+        return Path(override).expanduser()
+
+    return Path(__file__).resolve().parent / "wandb_backups"
+
+
+BACKUP_BASE = _resolve_backup_base()
 
 PROJECT_FOLDER = (
     BACKUP_BASE / f"{WANDB_ENTITY}_{WANDB_PROJECT}"

@@ -19,6 +19,7 @@ import posixpath
 import stat as _stat
 import threading
 import time
+from pathlib import Path
 
 import paramiko
 
@@ -47,6 +48,19 @@ def _load_dotenv(path=".env"):
 
 
 _load_dotenv()
+
+def resolve_backup_base():
+    """Local staging directory the backup scripts read/write to.
+
+    BACKUP_BASE_DIR wins when set. Otherwise defaults to a
+    wandb_backups/ folder next to this file, so it works on whatever
+    machine the script is checked out on without editing code."""
+    override = os.environ.get("BACKUP_BASE_DIR")
+    if override:
+        return Path(override).expanduser()
+
+    return Path(__file__).resolve().parent / "wandb_backups"
+
 
 # Base remote directory backups are written under. Relative (no
 # leading slash) so it resolves against whatever home/default

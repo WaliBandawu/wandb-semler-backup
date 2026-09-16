@@ -45,7 +45,7 @@ MAX_WORKERS = min(48, ((os.cpu_count() or 4) + 4) * 2)
 WANDB_ENTITY = "theta-tech-ai"
 WANDB_PROJECT = "semler-qfhd"
 
-BACKUP_BASE = Path("/home/ubuntu/wandb_backups")
+BACKUP_BASE = sftp_lib.resolve_backup_base()
 PROJECT_FOLDER = BACKUP_BASE / f"{WANDB_ENTITY}_{WANDB_PROJECT}"
 CKPT_STAGING = BACKUP_BASE / "_ckpt_staging"
 MANIFEST_FILE = PROJECT_FOLDER / "ckpt_manifest.json"
